@@ -1,4 +1,4 @@
-#include "config.h"
+// #include "config.h"
 
 // Whether to enable PCRE2 regular expression support in blacklists, enabled by default
 #cmakedefine CONFIG_REGEX_PCRE2 1

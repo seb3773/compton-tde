@@ -10,7 +10,7 @@ BUILD_DIR="package_build"
 DEB_NAME="${PACKAGE_NAME}_${VERSION}_${ARCH}.deb"
 
 # Paths
-SOURCE_BUILD_DIR="../../build/twin/compton-tde"
+SOURCE_BUILD_DIR="."
 
 echo "Creating .deb package for $PACKAGE_NAME..."
 
@@ -25,11 +25,17 @@ if [ -f "$SOURCE_BUILD_DIR/compton-tde" ]; then
     cp "$SOURCE_BUILD_DIR/compton-tde" "$BUILD_DIR/opt/trinity/bin/"
     chmod 755 "$BUILD_DIR/opt/trinity/bin/compton-tde"
     
-    # Apply sstrip
-    echo "Applying sstrip..."
-    sstrip "$BUILD_DIR/opt/trinity/bin/compton-tde"
+    # Strip is already done by build process optionally, but valid to do here again if needed.
+    # checking if sstrip exists
+    if command -v sstrip >/dev/null 2>&1; then
+        echo "Applying sstrip..."
+        sstrip "$BUILD_DIR/opt/trinity/bin/compton-tde"
+    else
+        echo "sstrip not found, using strip..."
+        strip --strip-all "$BUILD_DIR/opt/trinity/bin/compton-tde"
+    fi
 else
-    echo "Error: compton-tde binary not found in $SOURCE_BUILD_DIR"
+    echo "Error: compton-tde binary not found in $SOURCE_BUILD_DIR. Please run 'make compton-tde' first."
     exit 1
 fi
 
@@ -41,11 +47,11 @@ Version: $VERSION
 Section: x11
 Priority: optional
 Architecture: $ARCH
-Depends: tdebase-trinity, libx11-6, libxcomposite1, libxdamage1, libxfixes3, libxrender1, libconfig11
+Depends: libx11-6, libxcomposite1, libxdamage1, libxfixes3, libxrender1, libconfig9 | libconfig11, libpcre2-8-0, libdbus-1-3
 Maintainer: $MAINTAINER
 Description: $DESCRIPTION
  High performance GL/XRender compositor for TDE.
- Compiled with -O3 -ffast-math -flto.
+ Standalone optimized build.
 EOF
 
 # Build package

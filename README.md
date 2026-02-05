@@ -1,36 +1,84 @@
-# Compton-TDE Optimized Build
+# Compton-TDE Optimized Standalone Build
 
-This is an optimized build of the compton compositor for Trinity Desktop Environment (TDE).
+This is a **standalone, optimized build** of the compton compositor for Trinity Desktop Environment (TDE).
+It has been decoupled from the core TDE build system to ensure portability across different Trinity versions and Linux distributions.
 
-## Optimization Strategy
+## Key Features
 
-Aggressive but still safe build flags to achieve a binary that is both **faster** and **smaller** than the stock TDE build.
+*   **Standalone Build**: Uses a standard `CMakeLists.txt` that depends only on system libraries (X11, OpenGL, libconfig, etc.), not on TDE internal macros. This ensures it compiles on any machine with the required dev packages.
+*   **Portability**: Automatically detects the version of `libconfig` (legacy vs modern) and adapts the source code accordingly.
+*   **Size Optimization**: 
+    - Hardcoded aggressive optimization flags (`-Os`, `-flto`, `-fvisibility=hidden`, etc.) to minimize binary size.
+    - Stripped section headers (requires `sstrip` or standard `strip`) to achieve a binary size of **~190KB** (comparable to stock builds).
+*   **Configuration**: Full support for `libconfig` parsing and PCRE2 regex is included.
 
-### Compilation Flags
-*   **`-O2`**: Used as the stable base (standard TDE uses this, keping it to avoid `-O3` code bloat).
-*   **`-flto`** (Target specific): Link Time Optimization. Enabling this allows the compiler to optimize across translation units, inlining functions where appropriate and reducing final binary size.
-*   **`-ffast-math`**: Enables aggressive floating-point optimizations. This improves performance for shadow and fade calculations which rely heavily on math operations.
-*   **`-fvisibility=hidden`**: Hides internal symbols, reducing the dynamic symbol table size and improving load times.
+## Requirements
 
-### Linker Optimizations
-*   **`-Wl,--gc-sections`**: Garbage Collect Sections. Combined with `-fdata-sections -ffunction-sections`, this removes any code or data that is not actually used by the application, significantly reducing binary size.
-*   **`sstrip`**: Using `sstrip` (super-strip) instead of standard `strip` removes absolutely everything from the ELF binary that isn't strictly required for execution (section headers, etc.), shaving off the last few kilobytes.
-
-### Fixes & Features
-*   **OpenGL Backend**: Explicitly enabled (`-DWITH_OPENGL=ON`) to ensure hardware acceleration is available.
-*   **Bug Fix**: Patched a critical `use-after-free` crash in `c2.c` (legacy TDE bug I think).
-    *   *Issue*: The original code freed a string (`tstr`) and then immediately accessed it for validity checks, leading to potential crashes during config parsing.
-    *   *Fix*: Reordered the logic to ensure the string is only freed *after* it has been used. This improves stability, especially with complex configurations.
-*   **Regex Support**: Enabled PCRE2 for advanced window matching rules.
-
-## Results
-*   **Binary Size**: ~160KB (Optimized)
-*   **Package Size**: ~60KB (.deb)
+Ensure you have the development packages for:
+*   X11 (libX11, libXcomposite, libXdamage, libXrender, libXfixes, libXrandr, libXinerama, libXext)
+*   OpenGL (libGL)
+*   PkgConfig
+*   **libconfig-dev** (Required for config file support)
+*   **dbus-1-dev**
+*   **libpcre2-dev**
 
 ## Build Instructions
-To reproduce this build:
+
+1.  **Configure**:
+    Run cmake. You can enable/disable features using `-DWITH_...`.
+    The build is configured to strictly require features like `libconfig` by default.
+
+    ```bash
+    cmake . -DWITH_LIBCONFIG=ON -DWITH_OPENGL=ON -DWITH_PCRE2=ON \
+            -DWITH_XRENDER=ON -DWITH_XFIXES=ON -DWITH_XCOMPOSITE=ON \
+            -DWITH_XDAMAGE=ON
+    ```
+
+    *Optimization flags are automatically applied by the CMake configuration.*
+
+2.  **Build**:
+    ```bash
+    make compton-tde
+    ```
+
+3.  **Optimize Size (Optional but Recommended)**:
+    If you have `sstrip` installed (from `elfkickers`):
+    ```bash
+    sstrip compton-tde
+    ```
+    Otherwise use standard strip:
+    ```bash
+    strip --strip-all compton-tde
+    ```
+
+4.  **Install**:
+    ```bash
+    sudo make install
+    # OR manually copy compton-tde to your bin path
+    ```
+
+## Notes on Binary Size
+The resulting binary is highly optimized. If you notice a slight size difference between systems (e.g. 175KB vs 190KB), it is typically due to:
+*   Compiler version differences (GCC 12 vs older).
+*   Library linking specifics (PLT/GOT entries).
+*   Embedded features (this build includes full config parsing logic).
+
+## Packaging
+
+To create a Debian package (`.deb`):
+
+1.  **Build the project first** (follow the instructions above). The binary `compton-tde` must exist.
+2.  Run the packaging script:
+    ```bash
+    ./create_deb.sh
+    ```
+    This will generate a `.deb` package in the current directory (e.g., `compton-tde_1.0_amd64.deb`).
+
+## Cleanup
+
+To clean up all build artifacts (recommended before committing to git):
+
 ```bash
-cmake . -DWITH_LIBCONFIG=ON -DWITH_OPENGL=ON -DWITH_PCRE2=ON -DWITH_XRENDER=ON -DWITH_XFIXES=ON -DWITH_XCOMPOSITE=ON -DWITH_XDAMAGE=ON
-make compton-tde
-./create_deb.sh
+make clean
+rm -rf CMakeFiles CMakeCache.txt cmake_install.cmake Makefile compton_config.h package_build
 ```
