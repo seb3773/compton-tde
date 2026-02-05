@@ -8,7 +8,7 @@ It has been decoupled from the core TDE build system to ensure portability acros
 *   **Standalone Build**: Uses a standard `CMakeLists.txt` that depends only on system libraries (X11, OpenGL, libconfig, etc.), not on TDE internal macros. This ensures it compiles on any machine with the required dev packages.
 *   **Portability**: Automatically detects the version of `libconfig` (legacy vs modern) and adapts the source code accordingly.
 *   **Size Optimization**: 
-    - Hardcoded aggressive optimization flags (`-Os`, `-flto`, `-fvisibility=hidden`, etc.) to minimize binary size.
+    - Hardcoded aggressive optimization flags (`-O2`, `-flto`, `-fvisibility=hidden`, etc.) to minimize binary size.
     - Stripped section headers (requires `sstrip` or standard `strip`) to achieve a binary size of **~190KB** (comparable to stock builds).
 *   **Configuration**: Full support for `libconfig` parsing and PCRE2 regex is included.
 
@@ -56,12 +56,6 @@ Ensure you have the development packages for:
     sudo make install
     # OR manually copy compton-tde to your bin path
     ```
-
-## Notes on Binary Size
-The resulting binary is highly optimized. If you notice a slight size difference between systems (e.g. 175KB vs 190KB), it is typically due to:
-*   Compiler version differences (GCC 12 vs older).
-*   Library linking specifics (PLT/GOT entries).
-*   Embedded features (this build includes full config parsing logic).
 
 ## Packaging
 
