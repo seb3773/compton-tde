@@ -1,6 +1,6 @@
-# Compton-TDE Optimized Standalone Build
+# Compton-TDE Optimized Standalone Build: compton-tde-X
 
-This is a **standalone, optimized build** of the compton compositor for Trinity Desktop Environment (TDE).
+This is an **optimized build** of the compton compositor for Trinity Desktop Environment (TDE).
 It has been decoupled from the core TDE build system to ensure portability across different Trinity versions and Linux distributions.
 
 ## Key Features
@@ -12,13 +12,19 @@ It has been decoupled from the core TDE build system to ensure portability acros
     - Stripped section headers (requires `sstrip` or standard `strip`) to achieve a binary size of **~175KB** (vs ~250KB stock).
 *   **Silent Build**: Optional `-DWITH_SILENT_BUILD=ON` flag to remove all console logging strings, saving ~20KB.
 *   **Code Optimization**:
-    - **Region Cache**: Implemented a stack-based cache for `XFixesCreateRegion` to reduce X server round-trips.
+    - **Region Cache**: Implemented a stack-based cache for `XFixesCreateRegion`, aligned to 64-byte cache lines to reduce X server round-trips.
     - **Picture Format Cache**: Cached `XRenderFindVisualFormat` lookups for hot paths, reducing function call overhead.
     - **Disable Debug Logging**: Configured `printf_dbg` to compile to no-ops when not debugging.
     - **Compiler Hints**: Added `HOT`/`COLD` attributes and `likely`/`unlikely` branch prediction hints.
     - **Structure Packing**: Reordered `struct _win` members to eliminate padding, improving cache testing.
     - **Data Types**: Switched to `float` for shadow convolution and `uint16_t` for coordinates to reduce memory usage.
     - **Code Refactoring**: Implemented generic `FREE` macros and merged duplicate window property update functions to reduce binary size.
+    - **SIMD Shadows**: SSE2-vectorized `sum_gaussian` for ~4x faster shadow blur computation on large kernels.
+    - **Integer Fading**: Replaced `double` arithmetic in `run_fade` with `uint64_t` to avoid FPU overhead.
+    - **OpenGL Extension Caching**: Cached `glXQueryExtensionsString`/`glGetString` results to avoid repeated X calls.
+    - **OpenGL Memory Leak Fix**: Fixed `get_fbconfig_from_visualinfo` leaking FBConfigs array.
+    - **OpenGL Shader Build**: Optimized shader string building with cached lengths and `sprintf` return values.
+    - **Monotonic Clock**: Replaced `gettimeofday` with `clock_gettime(CLOCK_MONOTONIC_COARSE)` for faster timing.
 *   **Configuration**: Full support for `libconfig` parsing and PCRE2 regex is included.
 *   **OpenGL Backend**: Explicitly enabled (`-DWITH_OPENGL=ON`) to ensure hardware acceleration is available.
 *   **Bug Fix**: Patched a critical `use-after-free` crash in `c2.c` (legacy TDE bug I think).
@@ -36,6 +42,17 @@ Ensure you have the development packages for:
 *   **libpcre2-dev**
 
 ## Build Instructions
+
+### Install Dependencies
+
+On Debian/Ubuntu-based systems, run:
+```bash
+./install_deps.sh
+```
+
+This will install all required development packages automatically.
+
+### Configure and Build
 
 1.  **Configure**:
     Run cmake. You can enable/disable features using `-DWITH_...`.
@@ -83,9 +100,13 @@ To create a Debian package (`.deb`):
 
 ## Cleanup
 
-To clean up all build artifacts  
+To clean up all build artifacts (recommended before committing to git):
 
 ```bash
 make clean
 rm -rf CMakeFiles CMakeCache.txt cmake_install.cmake Makefile compton_config.h package_build
 ```
+
+## Sample Configuration
+
+For reference, I've included my personal configuration in `myconfig/.compton-tde.conf`. This config provides Windows 10-like shadows and includes workarounds for display issues with certain applications (Chrome, Electron apps, etc.). Feel free to use it as a starting point for your own setup.

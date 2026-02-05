@@ -86,39 +86,63 @@ wd_is_in_str(const char *haystick, const char *needle) {
 }
 
 /**
- * Check if a GLX extension exists.
+ * Extension type for glx_has_ext.
+ */
+typedef enum {
+  EXT_TYPE_GLX,
+  EXT_TYPE_GL
+} ext_type_t;
+
+/**
+ * Check if a GLX or GL extension exists (cached).
  */
 static inline bool
-glx_hasglxext(session_t *ps, const char *ext) {
-  const char *glx_exts = glXQueryExtensionsString(ps->dpy, ps->scr);
-  if (!glx_exts) {
-    printf_errf("(): Failed get GLX extension list.");
+glx_has_ext(session_t *ps, ext_type_t type, const char *ext) {
+  static const char *cached_glx_exts = NULL;
+  static const char *cached_gl_exts = NULL;
+
+  const char *exts = NULL;
+
+  if (type == EXT_TYPE_GLX) {
+    if (!cached_glx_exts) {
+      cached_glx_exts = glXQueryExtensionsString(ps->dpy, ps->scr);
+    }
+    exts = cached_glx_exts;
+  } else {
+    if (!cached_gl_exts) {
+      cached_gl_exts = (const char *) glGetString(GL_EXTENSIONS);
+    }
+    exts = cached_gl_exts;
+  }
+
+  if (!exts) {
+    printf_errf("(): Failed to get %s extension list.",
+        type == EXT_TYPE_GLX ? "GLX" : "GL");
     return false;
   }
 
-  bool found = wd_is_in_str(glx_exts, ext);
+  bool found = wd_is_in_str(exts, ext);
   if (!found)
-    printf_errf("(): Missing GLX extension %s.", ext);
+    printf_errf("(): Missing %s extension %s.",
+        type == EXT_TYPE_GLX ? "GLX" : "GL", ext);
 
   return found;
 }
 
 /**
- * Check if a GLX extension exists.
+ * Check if a GLX extension exists (wrapper).
+ */
+static inline bool
+glx_hasglxext(session_t *ps, const char *ext) {
+  return glx_has_ext(ps, EXT_TYPE_GLX, ext);
+}
+
+/**
+ * Check if a GL extension exists (wrapper).
  */
 static inline bool
 glx_hasglext(session_t *ps, const char *ext) {
-  const char *gl_exts = (const char *) glGetString(GL_EXTENSIONS);
-  if (!gl_exts) {
-    printf_errf("(): Failed get GL extension list.");
-    return false;
-  }
-
-  bool found = wd_is_in_str(gl_exts, ext);
-  if (!found)
-    printf_errf("(): Missing GL extension %s.", ext);
-
-  return found;
+  return glx_has_ext(ps, EXT_TYPE_GL, ext);
 }
 
 static inline XVisualInfo *

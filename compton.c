@@ -11,10 +11,11 @@
 
 #include "compton.h"
 #include <ctype.h>
+#include <emmintrin.h>  // SSE2 intrinsics
 
 // --- Region Cache ---
 #define REGION_CACHE_SIZE 128
-static XserverRegion region_cache[REGION_CACHE_SIZE];
+static XserverRegion region_cache[REGION_CACHE_SIZE] __attribute__((aligned(64)));
 static int region_cache_count = 0;
 
 static XserverRegion rc_create_region(session_t *ps) {
@@ -161,16 +162,20 @@ run_fade(session_t *ps, win *w, unsigned steps) {
     w->opacity = w->opacity_tgt;
   }
   else if (steps) {
-    // Use double below because opacity_t will probably overflow during
-    // calculations
-    if (w->opacity < w->opacity_tgt)
-      w->opacity = normalize_d_range(
-          (double) w->opacity + (double) ps->o.fade_in_step * steps,
-          0.0, w->opacity_tgt);
-    else
-      w->opacity = normalize_d_range(
-          (double) w->opacity - (double) ps->o.fade_out_step * steps,
-          w->opacity_tgt, OPAQUE);
+    // Use 64-bit integer to avoid overflow (opacity_t is uint32_t)
+    if (w->opacity < w->opacity_tgt) {
+      uint64_t new_opacity = (uint64_t)w->opacity + (uint64_t)ps->o.fade_in_step * steps;
+      w->opacity = (new_opacity > w->opacity_tgt) ? w->opacity_tgt : (opacity_t)new_opacity;
+    }
+    else {
+      uint64_t step_amount = (uint64_t)ps->o.fade_out_step * steps;
+      if (step_amount >= w->opacity - w->opacity_tgt) {
+        w->opacity = w->opacity_tgt;
+      }
+      else {
+        w->opacity -= (opacity_t)step_amount;
+      }
+    }
   }
 
   if (w->opacity != w->opacity_tgt) {
@@ -259,7 +264,7 @@ make_gaussian_map(double r) {
  */
 
 static unsigned char
-sum_gaussian(conv *map, double opacity,
+sum_gaussian(conv *map, float opacity,
              int x, int y, int width, int height) {
   int fx, fy;
   float *g_data;
@@ -268,7 +273,7 @@ sum_gaussian(conv *map, double opacity,
   int center = g_size / 2;
   int fx_start, fx_end;
   int fy_start, fy_end;
-  double v;
+  float v;
 
   /*
    * Compute set of filter values which are "in range",
@@ -292,20 +297,54 @@ sum_gaussian(conv *map, double opacity,
 
   g_line = g_line + fy_start * g_size + fx_start;
 
-  v = 0;
+  v = 0.0f;
+
+  int row_len = fx_end - fx_start;
+
+#if defined(__SSE2__)
+  // SSE2 vectorized summation (4 floats per iteration)
+  __m128 sum_vec = _mm_setzero_ps();
 
   for (fy = fy_start; fy < fy_end; fy++) {
     g_data = g_line;
     g_line += g_size;
 
-    for (fx = fx_start; fx < fx_end; fx++) {
-      v += *g_data++;
+    int i = 0;
+    int simd_end = row_len - (row_len & 3);  // Round down to multiple of 4
+
+    for (; i < simd_end; i += 4) {
+      __m128 vals = _mm_loadu_ps(g_data + i);
+      sum_vec = _mm_add_ps(sum_vec, vals);
+    }
+
+    // Scalar remainder
+    for (; i < row_len; i++) {
+      v += g_data[i];
     }
   }
 
-  if (v > 1) v = 1;
+  // Horizontal sum of sum_vec
+  __m128 shuf = _mm_shuffle_ps(sum_vec, sum_vec, _MM_SHUFFLE(2, 3, 0, 1));
+  __m128 sums = _mm_add_ps(sum_vec, shuf);
+  shuf = _mm_movehl_ps(shuf, sums);
+  sums = _mm_add_ss(sums, shuf);
+  v += _mm_cvtss_f32(sums);
 
-  return ((unsigned char) (v * opacity * 255.0));
+#else
+  // Scalar fallback
+  for (fy = fy_start; fy < fy_end; fy++) {
+    g_data = g_line;
+    g_line += g_size;
+
+    for (fx = 0; fx < row_len; fx++) {
+      v += *g_data++;
+    }
+  }
+#endif
+
+  if (v > 1.0f) v = 1.0f;
+
+  return ((unsigned char) (v * opacity * 255.0f));
 }
 
 /* precompute shadow corners and sides

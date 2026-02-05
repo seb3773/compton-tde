@@ -35,14 +35,21 @@ get_fbconfig_from_visualinfo(session_t *ps, const XVisualInfo *visualinfo) {
   int nelements = 0;
   GLXFBConfig *fbconfigs = glXGetFBConfigs(ps->dpy, visualinfo->screen,
       &nelements);
+  if (!fbconfigs)
+    return NULL;
+
+  GLXFBConfig result = NULL;
   for (int i = 0; i < nelements; ++i) {
     int visual_id = 0;
     if (Success == glXGetFBConfigAttrib(ps->dpy, fbconfigs[i], GLX_VISUAL_ID, &visual_id)
-        && visual_id == visualinfo->visualid)
-      return fbconfigs[i];
+        && visual_id == visualinfo->visualid) {
+      result = fbconfigs[i];
+      break;
+    }
   }
 
-  return NULL;
+  XFree(fbconfigs);
+  return result;
 }
 
 #ifdef DEBUG_GLX_DEBUG_CONTEXT
@@ -452,7 +459,12 @@ glx_init_blur(session_t *ps) {
       {
         int wid = XFixedToDouble(kern[0]), hei = XFixedToDouble(kern[1]);
         int nele = wid * hei - 1;
-        int len = strlen(FRAG_SHADER_BLUR_PREFIX) + strlen(sampler_type) + strlen(extension) + (strlen(shader_add) + strlen(texture_func) + 42) * nele + strlen(FRAG_SHADER_BLUR_SUFFIX) + strlen(texture_func) + 12 + 1;
+        // Cache string lengths (avoid repeated strlen calls)
+        const size_t sampler_len = strlen(sampler_type);
+        const size_t ext_len = strlen(extension);
+        const size_t shader_add_len = strlen(shader_add);
+        const size_t texture_func_len = strlen(texture_func);
+        int len = 256 + sampler_len + ext_len + (shader_add_len + texture_func_len + 42) * nele + 128;
         char *shader_str = calloc(len, sizeof(char));
         if (!shader_str) {
           printf_errf("(): Failed to allocate %d bytes for shader string.", len);
@@ -460,9 +472,8 @@ glx_init_blur(session_t *ps) {
         }
         {
           char *pc = shader_str;
-          sprintf(pc, FRAG_SHADER_BLUR_PREFIX, extension, sampler_type);
-          pc += strlen(pc);
-          assert(strlen(shader_str) < len);
+          // Use sprintf return value instead of strlen(pc)
+          pc += sprintf(pc, FRAG_SHADER_BLUR_PREFIX, extension, sampler_type);
 
           double sum = 0.0;
           for (int j = 0; j < hei; ++j) {
@@ -473,14 +484,11 @@ glx_init_blur(session_t *ps) {
               if (0.0 == val)
                 continue;
               sum += val;
-              sprintf(pc, shader_add, val, texture_func, k - wid / 2, j - hei / 2);
-              pc += strlen(pc);
-              assert(strlen(shader_str) < len);
+              pc += sprintf(pc, shader_add, val, texture_func, k - wid / 2, j - hei / 2);
             }
           }
 
           sprintf(pc, FRAG_SHADER_BLUR_SUFFIX, texture_func, sum);
-          assert(strlen(shader_str) < len);
         }
         ppass->frag_shader = glx_create_shader(GL_FRAGMENT_SHADER, shader_str);
         free(shader_str);
