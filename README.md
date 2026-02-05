@@ -83,7 +83,7 @@ To create a Debian package (`.deb`):
 
 ## Cleanup
 
-To clean up all build artifacts (recommended before committing to git):
+To clean up all build artifacts  
 
 ```bash
 make clean
