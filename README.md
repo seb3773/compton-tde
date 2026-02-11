@@ -66,6 +66,15 @@ This will install all required development packages automatically.
 
     *Optimization flags are automatically applied by the CMake configuration.*
 
+    **For smallest binary size (recommended)**, add `-DWITH_SILENT_BUILD=ON`:
+    ```bash
+    cmake . -DWITH_LIBCONFIG=ON -DWITH_OPENGL=ON -DWITH_PCRE2=ON \
+            -DWITH_XRENDER=ON -DWITH_XFIXES=ON -DWITH_XCOMPOSITE=ON \
+            -DWITH_XDAMAGE=ON -DWITH_SILENT_BUILD=ON
+    ```
+
+    *Note: The CMake configuration automatically detects and uses the best available linker (gold > lld > standard ld).*
+
 2.  **Build**:
     ```bash
     make compton-tde
@@ -86,6 +95,39 @@ This will install all required development packages automatically.
     sudo make install
     # OR manually copy compton-tde to your bin path
     ```
+
+## Linker Optimization
+
+The build system automatically detects and uses the best available linker:
+
+### Available Linkers (in order of preference):
+
+1.  **Gold Linker** (`binutils-gold`):
+    - **Recommended for optimal binary size**
+    - Uses Identical Code Folding (ICF) to merge identical functions
+    - Produces binaries ~15-20% smaller than standard ld
+    - Automatically used if `ld.gold` is available
+
+2.  **LLD Linker** (`lld`):
+    - Fast linker from the LLVM project
+    - Good optimization, faster than gold
+    - Used if gold is not available but lld is
+
+3.  **Standard GNU Linker** (`ld`):
+    - Fallback option
+    - Works on all systems but produces larger binaries
+    - Used if neither gold nor lld are available
+
+### Expected Binary Sizes:
+
+| Configuration | Approximate Size | Notes |
+|---------------|-----------------|-------|
+| Standard ld + logging | 200-210KB | Baseline |
+| Gold linker + logging | 180-190KB | ~15% smaller |
+| Gold linker + silent build | 175-180KB | No console logging |
+| Gold linker + silent + sstrip | **170-175KB** | **Optimal** |
+
+*Note: The `install_deps.sh` script will offer to install `binutils-gold` and `elfkickers` (for `sstrip`) for optimal results.*
 
 ## Packaging
 
