@@ -32,6 +32,45 @@ It has been decoupled from the core TDE build system to ensure portability acros
     *   *Fix*: Reordered the logic to ensure the string is only freed *after* it has been used. This improves stability, especially with complex configurations.
 
 
+# Version 3.0 – Enhanced Window Condition Matching
+
+## PCRE2 Match Data Fix (`c2.c`)
+
+During the PCRE1 → PCRE2 migration I introduced a crash in the regex matching path (`~=` operator):
+ `pcre2_match()` requires a valid `pcre2_match_data *` block — it cannot be `NULL`. The original PCRE1 API (`pcre_exec`) accepted `NULL` for its optional `extra` argument, but PCRE2 does not allow NULL here. After migration, the `NULL` placeholder was kept, causing a segfault whenever a PCRE2 regex condition (`~=`) was evaluated...
+--> Added `pcre2_match_data *regex_pcre_match` to `c2_l_t`; allocated via `pcre2_match_data_create_from_pattern()` after compilation and freed in `c2_free()`, so the match block is now passed correctly to every `pcre2_match()` call.
+
+## New Predefined Condition Targets (`c2.h`, `c2.c`)
+
+Two new predefined targets backported from picom:
+
+| Target | Type | Description |
+|--------|------|-------------|
+| `group_focused` | boolean | True if any window in the same leader group as the current window is focused. Uses the existing `ps->active_leader` tracking. |
+| `urgent` | boolean | True if the window has the `XUrgencyHint` flag set in its `WM_HINTS` property. Read on-demand via `XGetWMHints()`. |
+
+**Example:**
+```ini
+opacity-rule = [ "80:group_focused = 0", "100:urgent = 1" ];
+```
+
+## PID-Based Window Class Inheritance (`compton.c`, `common.h`)
+
+Applications like Chrome/Electron/Chromium create popup, menu, tooltip, and overlay windows as `override-redirect` X11 windows. These transient windows frequently do **not** have `WM_CLASS` set directly on them, even when the main application window does :-( This caused conditions like `class_i *= 'chrome'` in `shadow-exclude` or `blur-background-exclude` to silently fail for all popup/menu windows from those applications ! For exeample, chrome auxiliary windows were listed with an empty class `()`, while the main browser window had `WM_CLASS = ("google-chrome", "Google-chrome")`.
+
+Th fix: (`win_get_class()` — `compton.c`): When `WM_CLASS` is not found on an `override-redirect` window, two fallback mechanisms are attempted in order:
+ - **`WM_TRANSIENT_FOR` inheritance**: If the window declares a parent via `WM_TRANSIENT_FOR`, and that parent window is a tracked compton window with a resolved class, the parent's `class_instance` and `class_general` are inherited.
+ - 2.  **`_NET_WM_PID` inheritance** (primary fix for Chrome/Electron): The window's `_NET_WM_PID` is read (via the new `ps->atom_pid` atom). All windows currently tracked in `ps->list` are scanned for a window with the **same PID** that already has `WM_CLASS` resolved (reading PID from `client_win` to correctly handle WM-reparented windows). When a PID-sibling is found, its class is inherited by the classless popup window.
+
+So now, popup and menu windows from Chrome, Chromium, and Electron applications are now automatically matched by `class_i`/`class_g` conditions.
+
+**Example**:
+```ini
+shadow-exclude = [ "class_i *= 'chrome'" ];
+blur-background-exclude = [ "class_i *= 'chrome'" ];
+```
+
+
 # Version 2.0 – Dual-Kawase Blur Support
 
 Version 2.0 introduces the Dual-Kawase blur method for background blurring, inspired by the implementation found in [picom](https://github.com/yshui/picom).
