@@ -104,6 +104,8 @@ struct _c2_l {
     C2_L_POVREDIR,
     C2_L_PARGB,
     C2_L_PFOCUSED,
+    C2_L_PGROUPFOCUSED,
+    C2_L_PURGENT,
     C2_L_PWMWIN,
     C2_L_PBSHAPED,
     C2_L_PROUNDED,
@@ -133,6 +135,7 @@ struct _c2_l {
   long ptnint;
 #ifdef CONFIG_REGEX_PCRE2
   pcre2_code *regex_pcre;
+  pcre2_match_data *regex_pcre_match;
 #endif
 };
 
@@ -193,6 +196,8 @@ const static c2_predef_t C2_PREDEFS[] = {
   [C2_L_POVREDIR    ] = { "override_redirect" , C2_L_TCARDINAL  , 0  },
   [C2_L_PARGB       ] = { "argb"              , C2_L_TCARDINAL  , 0  },
   [C2_L_PFOCUSED    ] = { "focused"           , C2_L_TCARDINAL  , 0  },
+  [C2_L_PGROUPFOCUSED]= { "group_focused"     , C2_L_TCARDINAL  , 0  },
+  [C2_L_PURGENT     ] = { "urgent"            , C2_L_TCARDINAL  , 0  },
   [C2_L_PWMWIN      ] = { "wmwin"             , C2_L_TCARDINAL  , 0  },
   [C2_L_PBSHAPED    ] = { "bounding_shaped"   , C2_L_TCARDINAL  , 0  },
   [C2_L_PROUNDED    ] = { "rounded_corners"   , C2_L_TCARDINAL  , 0  },

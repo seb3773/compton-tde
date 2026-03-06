@@ -880,6 +880,15 @@ static bool c2_l_postprocess(session_t *ps, c2_l_t *pleaf) {
                "offset %zu: %s",
                pleaf->ptnstr, errorOffset, errorMsg);
     }
+
+    // Allocate match data block (required by pcre2_match, cannot be NULL)
+    pleaf->regex_pcre_match = pcre2_match_data_create_from_pattern(
+        pleaf->regex_pcre, NULL);
+    if (!pleaf->regex_pcre_match) {
+      c2_error("Pattern \"%s\": Failed to allocate PCRE2 match data.",
+               pleaf->ptnstr);
+    }
+
 #ifdef CONFIG_REGEX_PCRE2_JIT
     int jit_res = pcre2_jit_compile(pleaf->regex_pcre, PCRE2_JIT_COMPLETE);
     if (jit_res < 0) {
@@ -921,6 +930,8 @@ static void c2_free(c2_ptr_t p) {
     free(pleaf->tgt);
     free(pleaf->ptnstr);
 #ifdef CONFIG_REGEX_PCRE2
+    if (pleaf->regex_pcre_match)
+      pcre2_match_data_free(pleaf->regex_pcre_match);
     pcre2_code_free(pleaf->regex_pcre);
 #endif
     free(pleaf);
@@ -1188,6 +1199,20 @@ static inline void c2_match_once_leaf(session_t *ps, win *w,
       case C2_L_PFOCUSED:
         tgt = win_is_focused_real(ps, w);
         break;
+      case C2_L_PGROUPFOCUSED:
+        // True if any window with the same leader as w is focused
+        tgt = (w->leader && ps->active_leader &&
+               w->leader == ps->active_leader);
+        break;
+      case C2_L_PURGENT: {
+        // Read WM_HINTS urgency flag from the client window
+        Window twid = (w->client_win ? w->client_win : w->id);
+        XWMHints *hints = XGetWMHints(ps->dpy, twid);
+        tgt = (hints && (hints->flags & XUrgencyHint)) ? 1 : 0;
+        if (hints)
+          XFree(hints);
+        break;
+      }
       case C2_L_PWMWIN:
         tgt = w->wmwin;
         break;
@@ -1343,7 +1368,8 @@ static inline void c2_match_once_leaf(session_t *ps, win *w,
       case C2_L_MPCRE:
 #ifdef CONFIG_REGEX_PCRE2
         *pres = (pcre2_match(pleaf->regex_pcre, (PCRE2_SPTR)tgt,
-                             PCRE2_ZERO_TERMINATED, 0, 0, NULL, NULL) >= 0);
+                             PCRE2_ZERO_TERMINATED, 0, 0,
+                             pleaf->regex_pcre_match, NULL) >= 0);
 #else
         assert(0);
 #endif

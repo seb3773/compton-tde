@@ -1167,6 +1167,8 @@ typedef struct _session_t {
   Atom atom_compton_shadow;
   /// Atom of property <code>_NET_WM_WINDOW_TYPE</code>.
   Atom atom_win_type;
+  /// Atom of property <code>_NET_WM_PID</code>.
+  Atom atom_pid;
   /// Atom of property <code>_TDE_TRANSPARENT_TO_BLACK</code>.
   Atom atom_win_type_tde_transparent_to_black;
   /// Atom of property <code>_TDE_TRANSPARENT_TO_DESKTOP</code>.

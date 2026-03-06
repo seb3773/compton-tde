@@ -4411,24 +4411,82 @@ win_get_class(session_t *ps, win *w) {
   w->class_general = NULL;
 
   // Retrieve the property string list
-  if (!wid_get_text_prop(ps, w->client_win, ps->atom_class, &strlst, &nstr))
-    return false;
-
-  // Copy the strings if successful
-  w->class_instance = mstrcpy(strlst[0]);
-
-  if (nstr > 1)
-    w->class_general = mstrcpy(strlst[1]);
-
-  XFreeStringList(strlst);
+  if (wid_get_text_prop(ps, w->client_win, ps->atom_class, &strlst, &nstr)
+      && nstr >= 1) {
+    // Copy the strings if successful
+    w->class_instance = mstrcpy(strlst[0]);
+    if (nstr > 1)
+      w->class_general = mstrcpy(strlst[1]);
+    XFreeStringList(strlst);
 
 #ifdef DEBUG_WINDATA
-  printf_dbgf("(%#010lx): client = %#010lx, "
-      "instance = \"%s\", general = \"%s\"\n",
-      w->id, w->client_win, w->class_instance, w->class_general);
+    printf_dbgf("(%#010lx): client = %#010lx, "
+        "instance = \"%s\", general = \"%s\"\n",
+        w->id, w->client_win, w->class_instance, w->class_general);
 #endif
+    return true;
+  }
 
-  return true;
+  // WM_CLASS not found on this window. For override-redirect windows (e.g.
+  // Chrome popup menus), try to inherit the class from:
+  //   1. The WM_TRANSIENT_FOR parent window (if set)
+  //   2. Another tracked window with the same _NET_WM_PID (PID-based grouping)
+  if (w->a.override_redirect) {
+    // --- 1. Try WM_TRANSIENT_FOR ---
+    Window transient = None;
+    if (XGetTransientForHint(ps->dpy, w->client_win, &transient)
+        && transient && transient != w->client_win) {
+      win *tw = find_toplevel(ps, transient);
+      if (!tw)
+        tw = find_win(ps, transient);
+      if (tw && tw->class_instance) {
+        w->class_instance = mstrcpy(tw->class_instance);
+        if (tw->class_general)
+          w->class_general = mstrcpy(tw->class_general);
+#ifdef DEBUG_WINDATA
+        printf_dbgf("(%#010lx): inherited class from transient parent %#010lx: "
+            "instance = \"%s\", general = \"%s\"\n",
+            w->id, transient, w->class_instance, w->class_general);
+#endif
+        return true;
+      }
+    }
+
+    // --- 2. Try _NET_WM_PID-based class inheritance ---
+    // Read the PID of this window (for OR windows, client_win == id)
+    if (ps->atom_pid) {
+      winprop_t pid_prop = wid_get_prop(ps, w->client_win, ps->atom_pid,
+                                        1L, XA_CARDINAL, 32);
+      if (pid_prop.nitems) {
+        long this_pid = winprop_get_int(pid_prop);
+        // Scan all tracked windows for one with the same PID and a class.
+        // Read PID from client_win (the actual app window, not the WM frame).
+        for (win *cw = ps->list; cw; cw = cw->next) {
+          if (cw == w || !cw->class_instance)
+            continue;
+          Window cw_id = cw->client_win ? cw->client_win : cw->id;
+          winprop_t cw_pid_prop = wid_get_prop(ps, cw_id, ps->atom_pid,
+                                               1L, XA_CARDINAL, 32);
+          if (cw_pid_prop.nitems) {
+            long cw_pid = winprop_get_int(cw_pid_prop);
+            if (cw_pid == this_pid) {
+              // Same process → inherit class
+              w->class_instance = mstrcpy(cw->class_instance);
+              if (cw->class_general)
+                w->class_general = mstrcpy(cw->class_general);
+              free_winprop(&cw_pid_prop);
+              free_winprop(&pid_prop);
+              return true;
+            }
+          }
+          free_winprop(&cw_pid_prop);
+        }
+      }
+      free_winprop(&pid_prop);
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -6932,6 +6990,7 @@ init_atoms(session_t *ps) {
   ps->atom_compton_shadow = get_atom(ps, "_TDE_WM_WINDOW_SHADOW");
 
   ps->atom_win_type = get_atom(ps, "_NET_WM_WINDOW_TYPE");
+  ps->atom_pid = get_atom(ps, "_NET_WM_PID");
   ps->atoms_wintypes[WINTYPE_UNKNOWN] = 0;
   ps->atoms_wintypes[WINTYPE_DESKTOP] = get_atom(ps,
       "_NET_WM_WINDOW_TYPE_DESKTOP");
