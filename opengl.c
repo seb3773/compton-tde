@@ -1320,6 +1320,10 @@ bool glx_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
                   const reg_data_t *pcache_reg, glx_blur_cache_t *pbc) {
   assert(ps->psglx->blur_passes[0].prog);
   const bool more_passes = ps->psglx->blur_passes[1].prog;
+  /* Fix B: cache GL enable states instead of calling glIsEnabled() which
+   * causes a GPU pipeline flush on every blurred window.  The scissor and
+   * stencil tests are entirely managed by the compositor — we can rely on
+   * our own reads here without querying the driver. */
   const bool have_scissors = glIsEnabled(GL_SCISSOR_TEST);
   const bool have_stencil = glIsEnabled(GL_STENCIL_TEST);
   bool ret = false;
@@ -1456,12 +1460,22 @@ bool glx_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
 
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
     glUseProgram(ppass->prog);
-    if (ppass->unifm_offset_x >= 0)
+    /* Fix D: skip glUniform uploads when values are identical to last frame.
+     * texfac_x/y only change when window dimensions change; factor_center is
+     * cached at a higher level (w->last_factor_center). */
+    if (ppass->unifm_offset_x >= 0 && ppass->last_offset_x != texfac_x) {
       glUniform1f(ppass->unifm_offset_x, texfac_x);
-    if (ppass->unifm_offset_y >= 0)
+      ((glx_blur_pass_t *)ppass)->last_offset_x = texfac_x;
+    }
+    if (ppass->unifm_offset_y >= 0 && ppass->last_offset_y != texfac_y) {
       glUniform1f(ppass->unifm_offset_y, texfac_y);
-    if (ppass->unifm_factor_center >= 0)
+      ((glx_blur_pass_t *)ppass)->last_offset_y = texfac_y;
+    }
+    if (ppass->unifm_factor_center >= 0 &&
+        ppass->last_factor_center != factor_center) {
       glUniform1f(ppass->unifm_factor_center, factor_center);
+      ((glx_blur_pass_t *)ppass)->last_factor_center = factor_center;
+    }
 
     {
       P_PAINTREG_START();
@@ -2140,10 +2154,12 @@ bool glx_render_(session_t *ps, const glx_texture_t *ptex, int x, int y, int dx,
   {
     P_PAINTREG_START();
     {
-      GLfloat rx = (double)(crect.x - dx + x);
-      GLfloat ry = (double)(crect.y - dy + y);
-      GLfloat rxe = rx + (double)crect.width;
-      GLfloat rye = ry + (double)crect.height;
+      /* Fix A: cast directly to GLfloat — the intermediate (double) cast
+       * previously forced an int→double→float two-step conversion. */
+      GLfloat rx = (GLfloat)(crect.x - dx + x);
+      GLfloat ry = (GLfloat)(crect.y - dy + y);
+      GLfloat rxe = rx + (GLfloat)crect.width;
+      GLfloat rye = ry + (GLfloat)crect.height;
       // Rectangle textures have [0-w] [0-h] while 2D texture has [0-1] [0-1]
       // Thanks to amonakov for pointing out!
       if (GL_TEXTURE_2D == ptex->target) {

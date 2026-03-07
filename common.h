@@ -536,6 +536,13 @@ typedef struct {
   GLint unifm_offset_y;
   /// Location of uniform "factor_center" in blur GLSL program.
   GLint unifm_factor_center;
+  /* Fix D: cached last-uploaded uniform values.
+   * Initialized to -1.0f (never a valid texfac value) so the first
+   * invocation always uploads.  Saves 0-3 glUniform1f calls per pass
+   * per window per frame when the window size / opacity is unchanged. */
+  GLfloat last_offset_x;
+  GLfloat last_offset_y;
+  GLfloat last_factor_center;
 } glx_blur_pass_t;
 
 typedef struct {
@@ -1017,11 +1024,16 @@ typedef struct _session_t {
   bool reg_ignore_expire;
   /// Time of last fading. In milliseconds.
   time_ms_t fade_time;
-  /// Head pointer of the error ignore linked list.
-  ignore_t *ignore_head;
-  /// Pointer to the <code>next</code> member of tail element of the error
-  /// ignore linked list.
-  ignore_t **ignore_tail;
+  /** §1.5: ring-buffer for X sequence numbers to ignore (replaces malloc
+   * chain). head_idx is the read pointer, tail_idx is the write pointer. Buffer
+   * is full when (tail_idx - head_idx) & IGNORE_BUF_MASK == IGNORE_BUF_MASK.
+   *  Size must be a power of 2 and > the maximum simultaneous ignored requests.
+   */
+#define IGNORE_BUF_SIZE 128u
+#define IGNORE_BUF_MASK (IGNORE_BUF_SIZE - 1u)
+  unsigned long ignore_buf[IGNORE_BUF_SIZE]; /**< circular sequence ring */
+  unsigned int ignore_head_idx;              /**< consumer index (read)  */
+  unsigned int ignore_tail_idx;              /**< producer index (write) */
   // Cached blur convolution kernels.
   XFixed *blur_kerns_cache[MAX_BLUR_PASS];
   /// Reset program after next paint.
@@ -1040,6 +1052,9 @@ typedef struct _session_t {
   // === Window related ===
   /// Linked list of all windows.
   struct _win *list;
+  /** §1.1: O(1) Window→win* lookup table.  256 buckets, open addressing via
+   *  ht_next.  Indexed by (Window & 0xFF).  Always kept in sync with list. */
+  struct _win *win_ht[256];
   /// Pointer to <code>win</code> of current active window. Used by
   /// EWMH <code>_NET_ACTIVE_WINDOW</code> focus detection. In theory,
   /// it's more reliable to store the window ID directly here, just in
@@ -1215,6 +1230,8 @@ typedef struct _session_t {
 typedef struct _win {
   // === Pointers (8 bytes) ===
   struct _win *next;
+  struct _win
+      *ht_next; /**< §1.1: hash-table collision chain, NULL-terminated */
   struct _win *prev_trans;
   XRenderPictFormat *pictfmt;
   char *name;
@@ -1243,6 +1260,7 @@ typedef struct _win {
   long prop_shadow;
   double frame_opacity;
   double shadow_opacity;
+  float last_factor_center; /**< §1.3: cached factor_center, -1 = never set */
 
   // === Ints / Enums (4 bytes) ===
   winmode_t mode;
@@ -1257,8 +1275,9 @@ typedef struct _win {
   opacity_t opacity_set;
   int16_t shadow_dx;
   int16_t shadow_dy;
-  int shadow_width;
-  int shadow_height;
+  uint16_t
+      shadow_width; /**< §2.1: was int (4B), now uint16_t (2B); saves 4B/win */
+  uint16_t shadow_height;
   int shadow_size;
   uint16_t left_width, right_width, top_width, bottom_width;
   int greyscale_blended_background_alpha_divisor;
@@ -1579,12 +1598,17 @@ static inline void print_timestamp(session_t *ps) {
 
 /**
  * Allocate the space and copy a string.
+ *
+ * §7 fix: return NULL when src is NULL.  The previous version called
+ * strlen(NULL) which is undefined behaviour and crashes under glibc
+ * _FORTIFY_SOURCE.  Concrete risk: mstrcpy(setlocale(LC_NUMERIC, NULL))
+ * at the option-parsing site — setlocale() CAN return NULL.
  */
 static inline char *mstrcpy(const char *src) {
+  if (!src)
+    return NULL;
   char *str = cmalloc(strlen(src) + 1, char);
-
   strcpy(str, src);
-
   return str;
 }
 
@@ -1916,20 +1940,51 @@ static inline Window get_tgt_window(session_t *ps) {
 }
 
 /**
- * Find a window from window id in window linked list of the session.
+ * §1.1: Hash-table helpers for O(1) Window → win* lookup.
+ *
+ * win_ht[256] in session_t is a 256-bucket open-hash table indexed by
+ * (Window & 0xFF).  X11 XIDs are sequential low integers so the low byte
+ * distributes well in practice.  Collision chains use the win::ht_next field.
+ *
+ * INVARIANT: every live (non-destroyed) win in ps->list is in win_ht, and
+ * every win in win_ht is also in ps->list.  Callers must call win_ht_insert
+ * after linking a new win into ps->list, and win_ht_remove before unlinking.
+ */
+static inline void win_ht_insert(session_t *ps, win *w) {
+  unsigned bucket = (unsigned)(w->id) & 0xFFu;
+  w->ht_next = ps->win_ht[bucket];
+  ps->win_ht[bucket] = w;
+}
+
+static inline void win_ht_remove(session_t *ps, win *w) {
+  unsigned bucket = (unsigned)(w->id) & 0xFFu;
+  win **cur = &ps->win_ht[bucket];
+  while (*cur) {
+    if (*cur == w) {
+      *cur = w->ht_next;
+      w->ht_next = NULL;
+      return;
+    }
+    cur = &(*cur)->ht_next;
+  }
+  /* Not found — can happen if remove is called on a not-yet-inserted win. */
+}
+
+/**
+ * Find a window from its XID.
+ *
+ * §1.1: O(1) amortised via win_ht, replacing the previous O(n) list scan.
+ * Destroyed windows are skipped so callers behave exactly as before.
  */
 static inline win *find_win(session_t *ps, Window id) {
   if (!id)
     return NULL;
 
-  win *w;
-
-  for (w = ps->list; w; w = w->next) {
+  for (win *w = ps->win_ht[(unsigned)id & 0xFFu]; w; w = w->ht_next) {
     if (w->id == id && !w->destroyed)
       return w;
   }
-
-  return 0;
+  return NULL;
 }
 
 /**

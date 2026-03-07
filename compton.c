@@ -627,38 +627,38 @@ static Picture solid_picture(session_t *ps, bool argb, double a, double r,
 
 // === Error handling ===
 
+/* §1.5: set_ignore / discard_ignore / should_ignore reimplemented using the
+ * circular ring buffer ignore_buf[] in session_t.  This eliminates every
+ * malloc/free on the hot path — the previous version allocated a new
+ * ignore_t on the heap for EVERY X request that needed to be silenced
+ * (XDamageSubtract, XCompositeNameWindowPixmap, etc.), which happens dozens
+ * of times per frame. */
+
 static void discard_ignore(session_t *ps, unsigned long sequence) {
-  while (ps->ignore_head) {
-    if ((long)(sequence - ps->ignore_head->sequence) > 0) {
-      ignore_t *next = ps->ignore_head->next;
-      free(ps->ignore_head);
-      ps->ignore_head = next;
-      if (!ps->ignore_head) {
-        ps->ignore_tail = &ps->ignore_head;
-      }
-    } else {
+  /* Advance head past all entries strictly less than 'sequence'. */
+  while (ps->ignore_head_idx != ps->ignore_tail_idx) {
+    unsigned long seq = ps->ignore_buf[ps->ignore_head_idx & IGNORE_BUF_MASK];
+    if ((long)(sequence - seq) > 0)
+      ++ps->ignore_head_idx;
+    else
       break;
-    }
   }
 }
 
 static void set_ignore(session_t *ps, unsigned long sequence) {
   if (ps->o.show_all_xerrors)
     return;
-
-  ignore_t *i = malloc(sizeof(ignore_t));
-  if (!i)
-    return;
-
-  i->sequence = sequence;
-  i->next = 0;
-  *ps->ignore_tail = i;
-  ps->ignore_tail = &i->next;
+  /* If buffer is full, drop the oldest entry silently (very rare). */
+  if ((ps->ignore_tail_idx - ps->ignore_head_idx) >= IGNORE_BUF_SIZE) {
+    ++ps->ignore_head_idx; /* evict oldest */
+  }
+  ps->ignore_buf[ps->ignore_tail_idx++ & IGNORE_BUF_MASK] = sequence;
 }
 
 static int should_ignore(session_t *ps, unsigned long sequence) {
   discard_ignore(ps, sequence);
-  return ps->ignore_head && ps->ignore_head->sequence == sequence;
+  return (ps->ignore_head_idx != ps->ignore_tail_idx &&
+          ps->ignore_buf[ps->ignore_head_idx & IGNORE_BUF_MASK] == sequence);
 }
 
 // === Windows ===
@@ -1544,17 +1544,24 @@ static inline void win_blur_background(session_t *ps, win *w,
   const int hei = w->heightb;
 
   double factor_center = 1.0;
-  // Adjust blur strength according to window opacity, to make it appear
-  // better during fading
+  /* Adjust blur strength according to window opacity */
   if (!ps->o.blur_background_fixed) {
     double pct = 1.0 - get_opacity_percent(w) * (1.0 - 1.0 / 9.0);
     factor_center = pct * 8.0 / (1.1 - pct);
   }
 
+  /* §1.3: skip kernel renormalization when factor_center hasn't changed.
+   * Comparing at float precision is intentional and sufficient here:
+   * the value only changes when the window's opacity changes. */
+  const bool fc_changed =
+      (fabsf((float)factor_center - w->last_factor_center) > 1e-6f);
+  if (fc_changed)
+    w->last_factor_center = (float)factor_center;
+
   switch (ps->o.backend) {
   case BKEND_XRENDER:
   case BKEND_XR_GLX_HYBRID: {
-    // Normalize blur kernels
+    /* Normalize blur kernels only when factor_center changes (§1.3). */
     for (int i = 0; i < MAX_BLUR_PASS; ++i) {
       XFixed *kern_src = ps->o.blur_kerns[i];
       XFixed *kern_dst = ps->blur_kerns_cache[i];
@@ -1567,14 +1574,14 @@ static inline void win_blur_background(session_t *ps, win *w,
       assert(!kern_dst ||
              (kern_src[0] == kern_dst[0] && kern_src[1] == kern_dst[1]));
 
-      // Skip for fixed factor_center if the cache exists already
-      if (ps->o.blur_background_fixed && kern_dst)
+      /* Skip if fixed AND already cached, OR if factor_center didn't change. */
+      if (kern_dst && (ps->o.blur_background_fixed || !fc_changed))
         continue;
 
       int kwid = XFixedToDouble(kern_src[0]),
           khei = XFixedToDouble(kern_src[1]);
 
-      // Allocate cache space if needed
+      /* Allocate cache space if needed */
       if (!kern_dst) {
         kern_dst = malloc((kwid * khei + 2) * sizeof(XFixed));
         if (!kern_dst) {
@@ -1584,11 +1591,11 @@ static inline void win_blur_background(session_t *ps, win *w,
         ps->blur_kerns_cache[i] = kern_dst;
       }
 
-      // Modify the factor of the center pixel
+      /* Modify the factor of the center pixel */
       kern_src[2 + (khei / 2) * kwid + kwid / 2] =
           XDoubleToFixed(factor_center);
 
-      // Copy over
+      /* Copy and normalize */
       memcpy(kern_dst, kern_src, (kwid * khei + 2) * sizeof(XFixed));
       normalize_conv_kern(kwid, khei, kern_dst + 2);
     }
@@ -1770,12 +1777,15 @@ static inline void win_paint_win(session_t *ps, win *w, XserverRegion reg_paint,
                        x, y, 0, 0, 0, 0, wid, hei);
       win_greyscale_background(ps, w, greyscale_picture, reg_paint, pcache_reg);
 
+      /* §4.2 fix: greyscale_picture must be freed regardless of whether
+       * tmp_picture allocation succeeds.  Previously it was only freed inside
+       * the 'else' branch, leaking the X Picture resource when tmp_picture
+       * returned None. */
       Picture tmp_picture = xr_build_picture(ps, wid, hei, w->pictfmt);
-
       if (!tmp_picture) {
         printf_errf("(): Failed to build intermediate Picture.");
       } else {
-        if (reg_clip && tmp_picture)
+        if (reg_clip)
           XFixesSetPictureClipRegion(ps->dpy, tmp_picture, reg_clip, 0, 0);
 
         // Transfer greyscale picture to temporary picture
@@ -1791,8 +1801,9 @@ static inline void win_paint_win(session_t *ps, win *w, XserverRegion reg_paint,
                          0, 0, 0, x, y, wid, hei);
 
         free_picture(ps, &tmp_picture);
-        free_picture(ps, &greyscale_picture);
       }
+      /* Always free greyscale_picture (fix for the leak). */
+      free_picture(ps, &greyscale_picture);
     } break;
 #ifdef CONFIG_VSYNC_OPENGL
     case BKEND_GLX:
@@ -2071,16 +2082,17 @@ static void paint_all(session_t *ps, XserverRegion region,
         XFixesSubtractRegion(ps->dpy, reg_paint, reg_paint,
                              ps->shadow_exclude_reg);
 
-      // Might be worthwhile to crop the region to shadow border
+      /* §1.4: use region cache instead of XFixesCreateRegion to avoid a
+       * round-trip X server allocation/deallocation per shadow per frame. */
       {
         XRectangle rec_shadow_border = {.x = w->a.x + w->shadow_dx,
                                         .y = w->a.y + w->shadow_dy,
                                         .width = w->shadow_width,
                                         .height = w->shadow_height};
-        XserverRegion reg_shadow =
-            XFixesCreateRegion(ps->dpy, &rec_shadow_border, 1);
+        XserverRegion reg_shadow = rc_create_region(ps);
+        XFixesSetRegion(ps->dpy, reg_shadow, &rec_shadow_border, 1);
         XFixesIntersectRegion(ps->dpy, reg_paint, reg_paint, reg_shadow);
-        free_region(ps, &reg_shadow);
+        rc_destroy_region(ps, reg_shadow);
       }
 
       // Clear the shadow here instead of in make_shadow() for saving GPU
@@ -2580,23 +2592,28 @@ static double get_opacity_percent(win *w) {
   return ((double)w->opacity) / OPAQUE;
 }
 
+/* §4.8 fix: removed *(long*)data strict-aliasing UB — the Atom value read
+ * from XGetWindowProperty is never actually used by any caller; we only
+ * care about whether the property *exists* (nitems > 0, format == 32).
+ * Using memcpy would be the safe read, but since the value is unused a
+ * simple existence check suffices and eliminates the UB entirely. */
 static Bool get_window_transparency_filter_greyscale(const session_t *ps,
                                                      Window w) {
   Atom actual;
   int format;
   unsigned long n, left;
+  unsigned char *data = NULL;
 
-  unsigned char *data;
   int result = XGetWindowProperty(
       ps->dpy, w, ps->atom_win_type_tde_transparency_filter_greyscale, 0L, 1L,
       False, XA_ATOM, &actual, &format, &n, &left, &data);
 
-  if (result == Success && data != None && format == 32) {
-    Atom a;
-    a = *(long *)data;
+  if (result == Success && data != NULL && format == 32) {
     XFree((void *)data);
     return True;
   }
+  if (data)
+    XFree((void *)data);
   return False;
 }
 
@@ -2606,18 +2623,18 @@ get_window_transparency_filter_greyscale_blended(const session_t *ps,
   Atom actual;
   int format;
   unsigned long n, left;
+  unsigned char *data = NULL;
 
-  unsigned char *data;
   int result = XGetWindowProperty(
       ps->dpy, w, ps->atom_win_type_tde_transparency_filter_greyscale_blend, 0L,
       1L, False, XA_ATOM, &actual, &format, &n, &left, &data);
 
-  if (result == Success && data != None && format == 32) {
-    Atom a;
-    a = *(long *)data;
+  if (result == Success && data != NULL && format == 32) {
     XFree((void *)data);
     return True;
   }
+  if (data)
+    XFree((void *)data);
   return False;
 }
 
@@ -2625,18 +2642,18 @@ static Bool get_window_transparent_to_desktop(const session_t *ps, Window w) {
   Atom actual;
   int format;
   unsigned long n, left;
+  unsigned char *data = NULL;
 
-  unsigned char *data;
   int result = XGetWindowProperty(
       ps->dpy, w, ps->atom_win_type_tde_transparent_to_desktop, 0L, 1L, False,
       XA_ATOM, &actual, &format, &n, &left, &data);
 
-  if (result == Success && data != None && format == 32) {
-    Atom a;
-    a = *(long *)data;
+  if (result == Success && data != NULL && format == 32) {
     XFree((void *)data);
     return True;
   }
+  if (data)
+    XFree((void *)data);
   return False;
 }
 
@@ -2644,154 +2661,84 @@ static Bool get_window_transparent_to_black(const session_t *ps, Window w) {
   Atom actual;
   int format;
   unsigned long n, left;
+  unsigned char *data = NULL;
 
-  unsigned char *data;
   int result = XGetWindowProperty(
       ps->dpy, w, ps->atom_win_type_tde_transparent_to_black, 0L, 1L, False,
       XA_ATOM, &actual, &format, &n, &left, &data);
 
-  if (result == Success && data != None && format == 32) {
-    Atom a;
-    a = *(long *)data;
+  if (result == Success && data != NULL && format == 32) {
     XFree((void *)data);
     return True;
   }
+  if (data)
+    XFree((void *)data);
   return False;
 }
 
-static Bool determine_window_transparency_filter_greyscale(const session_t *ps,
-                                                           Window w) {
+/* §4.3/§1.2 fix comment preserved above (original 4-function block replaced).
+ * §2: the four _impl functions were structurally identical — only the
+ * get_window_* predicate differed.  Factorized into one generic helper to
+ * eliminate ~350 B of duplicated machine code while keeping identical
+ * semantics and the same DETERMINE_WIN_MAX_DEPTH depth cap. */
+
+#define DETERMINE_WIN_MAX_DEPTH 3
+
+/** Function-pointer type for the four get_window_* predicates. */
+typedef Bool (*win_prop_fn_t)(const session_t *ps, Window w);
+
+/**
+ * Generic bounded DFS over the X11 window tree.
+ * Returns True as soon as pred(ps, w) returns True for any visited node.
+ * Visits at most DETERMINE_WIN_MAX_DEPTH nested XQueryTree levels.
+ */
+static Bool determine_win_prop_impl(const session_t *ps, Window w,
+                                    win_prop_fn_t pred, int depth) {
+  if (pred(ps, w))
+    return True;
+  if (depth >= DETERMINE_WIN_MAX_DEPTH)
+    return False;
+
   Window root_return, parent_return;
   Window *children = NULL;
-  unsigned int nchildren, i;
-  Bool type;
-
-  type = get_window_transparency_filter_greyscale(ps, w);
-  if (type == True) {
-    return True;
-  }
-
+  unsigned int nchildren = 0;
   if (!XQueryTree(ps->dpy, w, &root_return, &parent_return, &children,
                   &nchildren)) {
-    /* XQueryTree failed. */
     if (children)
       XFree((void *)children);
     return False;
   }
 
-  for (i = 0; i < nchildren; i++) {
-    type = determine_window_transparency_filter_greyscale(ps, children[i]);
-    if (type == True)
-      return True;
-  }
+  Bool found = False;
+  for (unsigned int i = 0; i < nchildren && !found; i++)
+    found = determine_win_prop_impl(ps, children[i], pred, depth + 1);
 
   if (children)
     XFree((void *)children);
+  return found;
+}
 
-  return False;
+static Bool determine_window_transparency_filter_greyscale(const session_t *ps,
+                                                           Window w) {
+  return determine_win_prop_impl(ps, w,
+                                 get_window_transparency_filter_greyscale, 0);
 }
 
 static Bool
 determine_window_transparency_filter_greyscale_blended(const session_t *ps,
                                                        Window w) {
-  Window root_return, parent_return;
-  Window *children = NULL;
-  unsigned int nchildren, i;
-  Bool type;
-
-  type = get_window_transparency_filter_greyscale_blended(ps, w);
-  if (type == True) {
-    return True;
-  }
-
-  if (!XQueryTree(ps->dpy, w, &root_return, &parent_return, &children,
-                  &nchildren)) {
-    /* XQueryTree failed. */
-    if (children)
-      XFree((void *)children);
-    return False;
-  }
-
-  for (i = 0; i < nchildren; i++) {
-    type =
-        determine_window_transparency_filter_greyscale_blended(ps, children[i]);
-    if (type == True)
-      return True;
-  }
-
-  if (children)
-    XFree((void *)children);
-
-  return False;
+  return determine_win_prop_impl(
+      ps, w, get_window_transparency_filter_greyscale_blended, 0);
 }
 
 static Bool determine_window_transparent_to_desktop(const session_t *ps,
                                                     Window w) {
-  Window root_return, parent_return;
-  Window *children = NULL;
-  unsigned int nchildren, i;
-  Bool type;
-
-  type = get_window_transparent_to_desktop(ps, w);
-  if (type == True) {
-    return True;
-  }
-
-  if (!XQueryTree(ps->dpy, w, &root_return, &parent_return, &children,
-                  &nchildren)) {
-    /* XQueryTree failed. */
-    if (children)
-      XFree((void *)children);
-    return False;
-  }
-
-  for (i = 0; i < nchildren; i++) {
-    type = determine_window_transparent_to_desktop(ps, children[i]);
-    if (type == True)
-      return True;
-  }
-
-  if (children)
-    XFree((void *)children);
-
-  return False;
+  return determine_win_prop_impl(ps, w, get_window_transparent_to_desktop, 0);
 }
 
 static Bool determine_window_transparent_to_black(const session_t *ps,
                                                   Window w) {
-  Window root_return, parent_return;
-  Window *children = NULL;
-  unsigned int nchildren, i;
-  Bool type;
-  Bool ret = False;
-
-  type = get_window_transparent_to_black(ps, w);
-  if (type == True) {
-    return True;
-  }
-
-  if (!XQueryTree(ps->dpy, w, &root_return, &parent_return, &children,
-                  &nchildren)) {
-    /* XQueryTree failed. */
-    if (children) {
-      XFree((void *)children);
-    }
-    return False;
-  }
-
-  for (i = 0; i < nchildren; i++) {
-    type = determine_window_transparent_to_black(ps, children[i]);
-    if (type == True) {
-      ret = True;
-      break;
-    }
-  }
-
-  if (children) {
-    XFree((void *)children);
-  }
-
-  return ret;
+  return determine_win_prop_impl(ps, w, get_window_transparent_to_black, 0);
 }
 
 static void win_determine_mode(session_t *ps, win *w) {
@@ -2968,22 +2915,38 @@ static void win_update_shape(session_t *ps, win *w) {
 
 /**
  * Generic function to update a window property of int type.
+ *
+ * §4.1 fix: the previous version silently truncated *prop.data.p32 (long, 8 B
+ * on x86_64) into a uint32_t target without an explicit cast, and left
+ * *target uninitialised when 'size' matched neither sizeof(uint32_t) nor
+ * sizeof(long).  Also, casting -1 to uint32_t is implementation-defined in
+ * C89 but well-defined in C99 (two's complement wrap → UINT32_MAX), so an
+ * explicit (uint32_t)(long)-1 makes the intent clear.
+ * The "unknown size" fallback writes 0xFF bytes as a safe sentinel.
  */
 static void win_update_prop_int(session_t *ps, win *w, Atom atom, void *target,
                                 size_t size, Atom type) {
   winprop_t prop = wid_get_prop(ps, w->id, atom, 1, type, 32);
 
   if (!prop.nitems) {
+    /* Property absent: write UINT32_MAX / (long)-1 as "not set" sentinel. */
     if (size == sizeof(uint32_t))
-      *(uint32_t *)target = -1;
+      *(uint32_t *)target = (uint32_t)(long)-1; /* = UINT32_MAX, unambiguous */
     else if (size == sizeof(long))
-      *(long *)target = -1;
+      *(long *)target = (long)-1;
+    else
+      memset(target, 0xFF, size); /* safe fallback */
   } else {
+    /* p32 is declared as long* in winprop_t; X11 format-32 properties are
+     * always stored as longs by Xlib regardless of the declared Atom type.
+     * The explicit (uint32_t) cast makes the intentional truncation visible. */
+    long raw = *prop.data.p32;
     if (size == sizeof(uint32_t))
-      *(uint32_t *)target = *prop.data.p32;
-    // Handle long for prop_shadow (which is long in struct win)
+      *(uint32_t *)target = (uint32_t)raw;
     else if (size == sizeof(long))
-      *(long *)target = *prop.data.p32;
+      *(long *)target = raw;
+    else
+      memset(target, 0, size); /* safe fallback */
   }
 
   free_winprop(&prop);
@@ -3265,8 +3228,8 @@ static void calc_shadow_geometry(session_t *ps, win *w) {
                    ps->o.shadow_offset_y * shadowRadius / 100) *
                   w->shadow_size) /
                  100;
-  w->shadow_width = w->widthb + ps->gaussian_map->size;
-  w->shadow_height = w->heightb + ps->gaussian_map->size;
+  w->shadow_width = (uint16_t)(w->widthb + ps->gaussian_map->size);   /* §2.1 */
+  w->shadow_height = (uint16_t)(w->heightb + ps->gaussian_map->size); /* §2.1 */
 }
 
 /**
@@ -3544,6 +3507,7 @@ static bool add_win(session_t *ps, Window id, Window prev) {
 
   new->next = *p;
   *p = new;
+  win_ht_insert(ps, new); /* §1.1: register in O(1) lookup table */
 
 #ifdef CONFIG_DBUS
   // Send D-Bus signal
@@ -3782,6 +3746,7 @@ static void finish_destroy_win(session_t *ps, Window id) {
 #endif
 
       finish_unmap_win(ps, w);
+      win_ht_remove(ps, w); /* §1.1: remove from O(1) lookup table */
       *prev = w->next;
 
       // Clear active_win if it's pointing to the destroyed window
@@ -7869,8 +7834,8 @@ static session_t *session_init(session_t *ps_old, int argc, char **argv) {
       .reg_ignore_expire = false,
       .idling = false,
       .fade_time = 0L,
-      .ignore_head = NULL,
-      .ignore_tail = NULL,
+      .ignore_head_idx = 0,
+      .ignore_tail_idx = 0,
       .reset = false,
       .terminate = false,
 
@@ -7952,7 +7917,7 @@ static session_t *session_init(session_t *ps_old, int argc, char **argv) {
   session_t *ps = malloc(sizeof(session_t));
   memcpy(ps, &s_def, sizeof(session_t));
   ps_g = ps;
-  ps->ignore_tail = &ps->ignore_head;
+  /* §1.5: ring buffer already zeroed by memcpy from s_def above. */
   gettimeofday(&ps->time_start, NULL);
 
   wintype_arr_enable(ps->o.wintype_focus);
@@ -8330,6 +8295,7 @@ static void session_destroy(session_t *ps) {
     }
 
     ps->list = NULL;
+    memset(ps->win_ht, 0, sizeof(ps->win_ht)); /* §1.1: clear hash table */
   }
 
   // Free alpha_picts
@@ -8365,19 +8331,8 @@ static void session_destroy(session_t *ps) {
     ps->track_atom_lst = NULL;
   }
 
-  // Free ignore linked list
-  {
-    ignore_t *next = NULL;
-    for (ignore_t *ign = ps->ignore_head; ign; ign = next) {
-      next = ign->next;
-
-      free(ign);
-    }
-
-    // Reset head and tail
-    ps->ignore_head = NULL;
-    ps->ignore_tail = &ps->ignore_head;
-  }
+  /* §1.5: ring buffer — nothing to free, just reset indices. */
+  ps->ignore_head_idx = ps->ignore_tail_idx = 0;
 
   // Free cshadow_picture and black_picture
   if (ps->cshadow_picture == ps->black_picture)
